@@ -12,7 +12,20 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <stdarg.h>
+#include <syslog.h>
+#include <time.h>
 #include <unistd.h>
+
+#define USB_RESPONDER_UPLOAD_DEBUG 1
+
+#if USB_RESPONDER_UPLOAD_DEBUG
+static int64_t debug_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+#endif
 
 /* 每写入这么多字节就主动把脏页刷到 NAND。机器只有 ~57MB 内存、NAND 写很慢，
  * 若任由脏页堆到 dirty_ratio（~9MB）触发 balance_dirty_pages，内核会强制 write()
@@ -21,8 +34,38 @@
  * 都有界，避免那种无界长停顿。 */
 #define USB_RESPONDER_UPLOAD_SYNC_INTERVAL (1u << 20)
 
+#if USB_RESPONDER_UPLOAD_DEBUG
+/* 直接写入 /dev/kmsg 确保消息出现在 dmesg 中，不依赖 syslogd/journald 是否运行 */
+static void debug_kmsg(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+
+static void debug_kmsg(const char* fmt, ...) {
+    char buf[512];
+    va_list ap;
+    int fd;
+    int n;
+
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n <= 0) {
+        return;
+    }
+
+    fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return;
+    }
+    /* <6> = LOG_INFO 优先级，消息会出现在 dmesg */
+    dprintf(fd, "<6>epass_upload: %s\n", buf);
+    close(fd);
+}
+#endif
+
 static void upload_pace_writeback(usb_responder_upload_session_t* session) {
     int fd;
+#if USB_RESPONDER_UPLOAD_DEBUG
+    int64_t t0 = debug_now_ms();
+#endif
     if (!session->fp || fflush(session->fp) != 0) {
         return;
     }
@@ -33,6 +76,19 @@ static void upload_pace_writeback(usb_responder_upload_session_t* session) {
     /* 落盘后的页已是干净页，主动让内核回收，避免页缓存在小内存机器上膨胀。
      * POSIX_FADV_DONTNEED 在部分 libc 上是 no-op，但关键的 fsync 已经达成目的。 */
     posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#if USB_RESPONDER_UPLOAD_DEBUG
+    {
+        int64_t elapsed = debug_now_ms() - t0;
+        debug_kmsg("sync done path=%s bytes=%llu elapsed_ms=%lld",
+                   session->relative_path,
+                   (unsigned long long)session->bytes_written,
+                   (long long)elapsed);
+        if (elapsed > 500) {
+            debug_kmsg("SLOW_SYNC path=%s elapsed_ms=%lld (>500ms!)",
+                       session->relative_path, (long long)elapsed);
+        }
+    }
+#endif
 }
 
 static void set_file_error(const char* prefix, const char* path) {
@@ -346,17 +402,29 @@ bool usb_responder_file_begin_upload(
     if (!session->fp) {
         session->used = false;
         set_file_error("fopen", session->temp_path);
+#if USB_RESPONDER_UPLOAD_DEBUG
+        debug_kmsg("begin_upload FAIL fopen path=%s temp=%s err=%s",
+                   relative_path, session->temp_path, strerror(errno));
+#endif
         return false;
     }
     session->transfer_id = transfer_id;
     session->bytes_written = 0;
     session->synced_bytes = 0;
+#if USB_RESPONDER_UPLOAD_DEBUG
+    debug_kmsg("begin_upload OK path=%s temp=%s tid=%u storage=%s",
+               relative_path, session->temp_path, transfer_id,
+               usb_responder_storage_name(storage));
+#endif
     return true;
 }
 
 bool usb_responder_file_append_upload_chunk(
     usb_responder_file_ops_t* ops, uint32_t transfer_id, const uint8_t* data, size_t size) {
     usb_responder_upload_session_t* session = NULL;
+#if USB_RESPONDER_UPLOAD_DEBUG
+    int64_t t0 = debug_now_ms();
+#endif
     if (!ops || !data || size == 0) {
         usb_responder_set_last_error("invalid upload chunk");
         return false;
@@ -366,20 +434,46 @@ bool usb_responder_file_append_upload_chunk(
         usb_responder_set_last_error("upload session not found");
         return false;
     }
+#if USB_RESPONDER_UPLOAD_DEBUG
+    {
+        int64_t t_fwrite = debug_now_ms();
+#endif
     if (fwrite(data, 1, size, session->fp) != size) {
         set_file_error("fwrite", session->temp_path);
         return false;
     }
+#if USB_RESPONDER_UPLOAD_DEBUG
+        int64_t fwrite_elapsed = debug_now_ms() - t_fwrite;
+        if (fwrite_elapsed > 100) {
+            debug_kmsg("SLOW_FWRITE path=%s size=%zu elapsed=%lldms total=%llu",
+                       session->relative_path, size, (long long)fwrite_elapsed,
+                       (unsigned long long)(session->bytes_written + size));
+        }
+    }
+#endif
     session->bytes_written += size;
     if (session->bytes_written - session->synced_bytes >= USB_RESPONDER_UPLOAD_SYNC_INTERVAL) {
         upload_pace_writeback(session);
         session->synced_bytes = session->bytes_written;
     }
+#if USB_RESPONDER_UPLOAD_DEBUG
+    {
+        int64_t total_elapsed = debug_now_ms() - t0;
+        if (total_elapsed > 200) {
+            debug_kmsg("SLOW_CHUNK path=%s size=%zu total_elapsed=%lldms total_written=%llu",
+                       session->relative_path, size, (long long)total_elapsed,
+                       (unsigned long long)session->bytes_written);
+        }
+    }
+#endif
     return true;
 }
 
 bool usb_responder_file_finish_upload(usb_responder_file_ops_t* ops, uint32_t transfer_id) {
     usb_responder_upload_session_t* session = NULL;
+#if USB_RESPONDER_UPLOAD_DEBUG
+    int64_t t0 = debug_now_ms();
+#endif
     if (!ops) {
         usb_responder_set_last_error("invalid file ops");
         return false;
@@ -389,9 +483,31 @@ bool usb_responder_file_finish_upload(usb_responder_file_ops_t* ops, uint32_t tr
         usb_responder_set_last_error("upload session not found");
         return false;
     }
+#if USB_RESPONDER_UPLOAD_DEBUG
+    {
+        char path_copy[USB_RESPONDER_PATH_MAX_LEN];
+        uint64_t total_bytes;
+        snprintf(path_copy, sizeof(path_copy), "%s", session->relative_path);
+        total_bytes = session->bytes_written;
+#endif
     if (session->fp) {
+#if USB_RESPONDER_UPLOAD_DEBUG
+        int64_t t_close = debug_now_ms();
+#endif
         fclose(session->fp);
         session->fp = NULL;
+#if USB_RESPONDER_UPLOAD_DEBUG
+        {
+            int64_t close_elapsed = debug_now_ms() - t_close;
+            debug_kmsg("finish fclose path=%s elapsed=%lldms total_bytes=%llu",
+                       path_copy, (long long)close_elapsed,
+                       (unsigned long long)total_bytes);
+            if (close_elapsed > 500) {
+                debug_kmsg("SLOW_FCLOSE path=%s elapsed=%lldms (>500ms!)",
+                           path_copy, (long long)close_elapsed);
+            }
+        }
+#endif
     }
     if (rename(session->temp_path, session->final_path) != 0) {
         set_file_error("rename", session->final_path);
@@ -407,6 +523,13 @@ bool usb_responder_file_finish_upload(usb_responder_file_ops_t* ops, uint32_t tr
             return false;
         }
     }
+#if USB_RESPONDER_UPLOAD_DEBUG
+        debug_kmsg("finish OK path=%s final=%s total_bytes=%llu total_elapsed=%lldms",
+                   path_copy, session->final_path,
+                   (unsigned long long)total_bytes,
+                   (long long)(debug_now_ms() - t0));
+    }
+#endif
     memset(session, 0, sizeof(*session));
     return true;
 }

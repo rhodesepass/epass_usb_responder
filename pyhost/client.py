@@ -19,7 +19,7 @@ DEFAULT_CHUNK = USB_REQUEST_CHUNK - 4
 def _write_exact(ep, data: bytes, timeout: int) -> None:
     sent = 0
     while sent < len(data):
-        n = ep.write(data[sent : sent + USB_REQUEST_CHUNK], timeout=timeout)
+        n = ep.write(data[sent: sent + USB_REQUEST_CHUNK], timeout=timeout)
         if n <= 0:
             raise IOError("USB write failed")
         sent += n
@@ -50,7 +50,8 @@ class UsbResponderClient:
         )
         if self._dev is None:
             raise RuntimeError(
-                f"未找到设备 vid=0x{vid:04x} pid=0x{pid:04x}" + (f" serial={serial!r}" if serial else "")
+                f"未找到设备 vid=0x{vid:04x} pid=0x{pid:04x}" +
+                (f" serial={serial!r}" if serial else "")
             )
         self._timeout = timeout_ms
         self._iface = interface
@@ -66,11 +67,13 @@ class UsbResponderClient:
             raise RuntimeError(f"无接口 {interface}")
         self._ep_in = usb.util.find_descriptor(
             intf,
-            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN,
+            custom_match=lambda e: usb.util.endpoint_direction(
+                e.bEndpointAddress) == usb.util.ENDPOINT_IN,
         )
         self._ep_out = usb.util.find_descriptor(
             intf,
-            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT,
+            custom_match=lambda e: usb.util.endpoint_direction(
+                e.bEndpointAddress) == usb.util.ENDPOINT_OUT,
         )
         if self._ep_in is None or self._ep_out is None:
             raise RuntimeError("未找到 bulk IN/OUT 端点（期望 0x81 / 0x02）")
@@ -90,14 +93,20 @@ class UsbResponderClient:
     def _send_frame(self, typ: int, payload: bytes = b"", req_id: Optional[int] = None) -> int:
         rid = self._next_id() if req_id is None else req_id
         raw = P.Frame(type=typ, request_id=rid, payload=payload).encode()
-        _write_exact(self._ep_out, raw[: P.HEADER_SIZE], self._timeout)
-        if len(raw) > P.HEADER_SIZE:
-            _write_exact(self._ep_out, raw[P.HEADER_SIZE :], self._timeout)
+        _write_exact(self._ep_out, raw, self._timeout)
+        # 当帧总长为端点最大包大小的整数倍时，需补发零长包(ZLP)通知设备传输结束
+        if len(raw) % self._ep_out.wMaxPacketSize == 0:
+            try:
+                self._ep_out.write(b"", timeout=self._timeout)
+            except Exception:
+                pass
         return rid
 
     def _recv_frame(self) -> P.Frame:
+        # _read_some 内部已用 wMaxPacketSize 对齐，每次读自然以 short packet
+        # 或收满请求量终止，不依赖设备端 ZLP。此处只需按需补足缓冲区。
         while len(self._rxbuf) < P.HEADER_SIZE:
-            self._read_some(self._rx_read_size)
+            self._read_some(P.HEADER_SIZE - len(self._rxbuf))
         hdr = bytes(self._rxbuf[: P.HEADER_SIZE])
         _magic, _ver, _typ, _fl, _rid, plen, _crc = struct_unpack_header(hdr)
         if plen > MAX_PAYLOAD:
@@ -110,17 +119,27 @@ class UsbResponderClient:
         return P.decode_frame(raw)
 
     def _read_some(self, size: int) -> None:
-        # 0 长度读是 bulk IN 的 ZLP 收尾包，不是错误：直接忽略，调用方循环会再读。
-        # 真正的超时由 pyusb 抛 USBTimeoutError，不会走到这里返回空。
-        chunk = self._ep_in.read(size, timeout=self._timeout)
-        if chunk is None or len(chunk) == 0:
+        # 用端点 wMaxPacketSize 作为最小读取单元：
+        # - 避免 read(size) 过小导致 libUSB OVERFLOW（UDC 驱动不支持拆分
+        #   FunctionFS 事件到多个 URB）
+        # - 每次 read 要么收到 short packet 自然终止，要么收满请求量按 USB
+        #   规范终止，全程不依赖设备端 ZLP
+        # - FunctionFS 残留的 ZLP 事件（0 字节）被循环吞掉
+        mps = self._ep_in.wMaxPacketSize
+        while True:
+            chunk = self._ep_in.read(max(size, mps), timeout=self._timeout)
+            if chunk is None or len(chunk) == 0:
+                # ZLP 残留：忽略，继续尝试读下一笔数据
+                continue
+            self._rxbuf.extend(bytes(chunk))
             return
-        self._rxbuf.extend(bytes(chunk))
+
 
     def _expect_kv(self, req_id: int) -> Dict[str, str]:
         fr = self._recv_frame()
         if fr.request_id != req_id:
-            raise RuntimeError(f"request_id 不匹配: 期望 {req_id} 收到 {fr.request_id}")
+            raise RuntimeError(
+                f"request_id 不匹配: 期望 {req_id} 收到 {fr.request_id}")
         if fr.type == P.MSG_ERROR:
             kv = P.decode_kv(fr.payload)
             raise RuntimeError(kv.get("message", "ERROR"))
@@ -156,14 +175,16 @@ class UsbResponderClient:
                 if not piece:
                     break
                 chunk_payload = struct_pack_u32(rid) + piece
-                self._send_frame(P.MSG_FILE_PUT_CHUNK, chunk_payload, req_id=rid)
+                self._send_frame(P.MSG_FILE_PUT_CHUNK,
+                                 chunk_payload, req_id=rid)
                 self._expect_kv(rid)
 
         self._send_frame(P.MSG_FILE_PUT_END, struct_pack_u32(rid), req_id=rid)
         self._expect_kv(rid)
 
     def file_get(self, remote_path: str, local_path: str) -> None:
-        rid = self._send_frame(P.MSG_FILE_GET, P.encode_kv([("path", remote_path)]))
+        rid = self._send_frame(
+            P.MSG_FILE_GET, P.encode_kv([("path", remote_path)]))
         fr = self._recv_frame()
         if fr.request_id != rid:
             raise RuntimeError(f"request_id 不匹配: 期望 {rid} 收到 {fr.request_id}")
@@ -267,17 +288,21 @@ def _local_perm(path: str) -> str:
 
 def _cp_one(cl: "UsbResponderClient", src: str, remote: str, args) -> None:
     perm = None if args.no_perm else (args.perm or _local_perm(src))
-    cl.file_put(src, remote, chunk_size=args.chunk, desire_storage=args.desire_storage, perm=perm)
+    cl.file_put(src, remote, chunk_size=args.chunk,
+                desire_storage=args.desire_storage, perm=perm)
     print(f"{src} -> {remote}")
 
 
 def _cp_dir(cl: "UsbResponderClient", src: str, remote_root: str, args) -> None:
     for root, _dirs, files in os.walk(src):
         rel = os.path.relpath(root, src)
-        remote_dir = remote_root if rel == "." else remote_root + "/" + rel.replace(os.sep, "/")
-        cl.dir_mkdir(remote_dir, parents=True, desire_storage=args.desire_storage)
+        remote_dir = remote_root if rel == "." else remote_root + \
+            "/" + rel.replace(os.sep, "/")
+        cl.dir_mkdir(remote_dir, parents=True,
+                     desire_storage=args.desire_storage)
         for name in files:
-            _cp_one(cl, os.path.join(root, name), remote_dir + "/" + name, args)
+            _cp_one(cl, os.path.join(root, name),
+                    remote_dir + "/" + name, args)
 
 
 def _parse_hex(s: str) -> int:
@@ -288,9 +313,12 @@ def _parse_hex(s: str) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="usb_responder 上位机（pyusb），协议见 PROTOCOL.md")
-    p.add_argument("--vid", type=_parse_hex, default=0x1d6b, help="USB Vendor ID（十六进制，如 0x1234）")
-    p.add_argument("--pid", type=_parse_hex, default=0x0203, help="USB Product ID")
+    p = argparse.ArgumentParser(
+        description="usb_responder 上位机（pyusb），协议见 PROTOCOL.md")
+    p.add_argument("--vid", type=_parse_hex, default=0x1d6b,
+                   help="USB Vendor ID（十六进制，如 0x1234）")
+    p.add_argument("--pid", type=_parse_hex,
+                   default=0x0203, help="USB Product ID")
     p.add_argument("--serial", default=None, help="按序列号筛选（可选）")
     p.add_argument("--interface", type=int, default=0, help="接口号，默认 0")
     p.add_argument(
@@ -309,20 +337,27 @@ def _build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("put", help="上传文件")
     sp.add_argument("local")
     sp.add_argument("remote")
-    sp.add_argument("--chunk", type=int, default=DEFAULT_CHUNK, help="每片字节数（默认约 16KiB）")
-    sp.add_argument("--desire-storage", choices=("nand", "sd"), default=None, help="期望写入存储")
+    sp.add_argument("--chunk", type=int, default=DEFAULT_CHUNK,
+                    help="每片字节数（默认约 16KiB）")
+    sp.add_argument("--desire-storage", choices=("nand", "sd"),
+                    default=None, help="期望写入存储")
     sp.add_argument("--perm", default=None, help="上传完成后 chmod 权限（八进制，如 0644）")
 
     scp = sub.add_parser(
         "cp",
         help="上传一个或多个文件，类似 cp：目标为目录时复制为 目标/源文件名",
     )
-    scp.add_argument("paths", nargs="+", metavar="SRC... DEST", help="一个或多个本地源，最后一个为设备目标")
+    scp.add_argument("paths", nargs="+", metavar="SRC... DEST",
+                     help="一个或多个本地源，最后一个为设备目标")
     scp.add_argument("-r", "--recursive", action="store_true", help="递归上传目录")
-    scp.add_argument("--chunk", type=int, default=DEFAULT_CHUNK, help="每片字节数（默认约 16KiB）")
-    scp.add_argument("--desire-storage", choices=("nand", "sd"), default=None, help="期望写入存储")
-    scp.add_argument("--perm", default=None, help="覆盖权限（八进制，如 0644）；默认保留本地文件原权限")
-    scp.add_argument("--no-perm", action="store_true", help="不设置权限，使用设备默认 umask")
+    scp.add_argument("--chunk", type=int,
+                     default=DEFAULT_CHUNK, help="每片字节数（默认约 16KiB）")
+    scp.add_argument("--desire-storage", choices=("nand",
+                     "sd"), default=None, help="期望写入存储")
+    scp.add_argument("--perm", default=None,
+                     help="覆盖权限（八进制，如 0644）；默认保留本地文件原权限")
+    scp.add_argument("--no-perm", action="store_true",
+                     help="不设置权限，使用设备默认 umask")
 
     sg = sub.add_parser("get", help="下载文件")
     sg.add_argument("remote")
@@ -333,25 +368,32 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sd = sub.add_parser("rm", help="删除文件或目录（目录为递归删除）")
     sd.add_argument("path")
-    sd.add_argument("--desire-storage", choices=("nand", "sd"), default=None, help="期望删除目标所在存储")
+    sd.add_argument("--desire-storage", choices=("nand", "sd"),
+                    default=None, help="期望删除目标所在存储")
 
     sm = sub.add_parser("mv", help="重命名")
     sm.add_argument("src")
     sm.add_argument("dst")
-    sm.add_argument("--desire-storage", choices=("nand", "sd"), default=None, help="期望源和目标所在存储")
+    sm.add_argument("--desire-storage", choices=("nand", "sd"),
+                    default=None, help="期望源和目标所在存储")
 
     sk = sub.add_parser("mkdir", help="创建目录")
     sk.add_argument("path")
-    sk.add_argument("-p", "--parents", action="store_true", help="递归创建父目录（类似 mkdir -p）")
-    sk.add_argument("--desire-storage", choices=("nand", "sd"), default=None, help="期望创建目标所在存储")
+    sk.add_argument("-p", "--parents", action="store_true",
+                    help="递归创建父目录（类似 mkdir -p）")
+    sk.add_argument("--desire-storage", choices=("nand", "sd"),
+                    default=None, help="期望创建目标所在存储")
 
     ss = sub.add_parser("stat", help="路径元数据（owner/perm/size/type）")
     ss.add_argument("path")
 
     se = sub.add_parser("exec", help="在设备上执行 shell 命令（/bin/sh -c）")
-    se.add_argument("--shell-timeout", type=int, default=0, help="设备侧超时 ms（0=设备默认）")
-    se.add_argument("--max-stdout", type=int, default=0, help="stdout 上限（0=设备默认）")
-    se.add_argument("--max-stderr", type=int, default=0, help="stderr 上限（0=设备默认）")
+    se.add_argument("--shell-timeout", type=int,
+                    default=0, help="设备侧超时 ms（0=设备默认）")
+    se.add_argument("--max-stdout", type=int,
+                    default=0, help="stdout 上限（0=设备默认）")
+    se.add_argument("--max-stderr", type=int,
+                    default=0, help="stderr 上限（0=设备默认）")
     se.add_argument("args", nargs=argparse.REMAINDER, help="命令（若含 - 开头请加 --）")
 
     return p
@@ -432,9 +474,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif args.cmd == "rm":
             cl.file_delete(args.path, desire_storage=args.desire_storage)
         elif args.cmd == "mv":
-            cl.file_rename(args.src, args.dst, desire_storage=args.desire_storage)
+            cl.file_rename(args.src, args.dst,
+                           desire_storage=args.desire_storage)
         elif args.cmd == "mkdir":
-            cl.dir_mkdir(args.path, parents=args.parents, desire_storage=args.desire_storage)
+            cl.dir_mkdir(args.path, parents=args.parents,
+                         desire_storage=args.desire_storage)
         elif args.cmd == "exec":
             cmd = " ".join(args.args).strip()
             if not cmd:
@@ -449,7 +493,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             sys.stdout.buffer.write(r.stdout)
             sys.stderr.buffer.write(r.stderr)
             if r.timed_out:
-                print(f"\n[timed_out duration_ms={r.duration_ms}]", file=sys.stderr)
+                print(
+                    f"\n[timed_out duration_ms={r.duration_ms}]", file=sys.stderr)
             ec = r.exit_code
             if ec < 0 or ec > 255:
                 return 1
